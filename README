@@ -1,0 +1,4 @@
+This is my final year project
+
+It is a FUSE layer that enables a user to 
+mount a DropBox account as a local filesystem. 
