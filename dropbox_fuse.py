@@ -5,11 +5,11 @@ import sys
 import stat
 import errno
 import pprint
-import time
 import tempfile
 import dropbox
+from dropbox.rest import ErrorResponse
 from config import AppCredentials # the file where app_secret and app_key are stored
-
+from time import time
 from threading import Lock
 from datetime import datetime
 from fuse import FUSE, FuseOSError, LoggingMixIn, fuse_get_context
@@ -19,6 +19,7 @@ class DropboxAPI():
         self.rwlock = Lock()
         self.client = self.dropbox_request()
         self.tree_contents = {}
+        self.tree_contents_cache = {}
 
     def dropbox_request(self):
 
@@ -32,8 +33,8 @@ class DropboxAPI():
 
         else:
             #log in and authenticate with dropbox
-            flow = dropbox.client.DropboxOAuth2FlowNoRedirect(AppCredentials.app_key, AppCredentials.app_secret)
-                        
+            flow = dropbox.client.DropboxOAuth2FlowNoRedirect(AppCredentials.app_key, \
+                                                            AppCredentials.app_secret)                       
             # Have the user sign in and authorize this token
             authorize_url = flow.start()
             print '1. Go to: ' + authorize_url
@@ -57,10 +58,49 @@ class DropboxAPI():
         acc_info = self.client.account_info()
         pprint.PrettyPrinter(indent = 2).pprint(acc_info)
 
-    def list_objects(self, path):
+    """
+    def get_all_metadata(self, path, files=None, cursor=None):
 
-        response = self.client.metadata(path)
-        
+        if files is None:
+            files = {}
+
+        cursor = None
+        has_more = True
+
+        while has_more:
+            response = self.client.delta(cursor, path)
+            cursor = response['cursor']
+            has_more = response['has_more']
+
+            if 'entries' not in response:
+                raise FuseOSError(errno.EIO) # IO error
+
+            for file_path, metadata in response['entries']:
+
+                if metadata is not None:
+                    files[file_path] = metadata
+                    #print metadata
+                    print
+                    print file_path
+                    print "====================="
+
+        return files
+    """
+
+    def list_objects(self, path, ttl=10):
+
+        # for efficiency check cache
+        # caching prevents calling metadata() constantly
+        if path in self.tree_contents_cache:
+            if self.tree_contents_cache[path] >= time():
+                return self.tree_contents[path]
+
+        try:
+            # obtain file/folder metadata from dropbox
+            response = self.client.metadata(path)
+        except ErrorResponse, e:
+            print "Error %s: %s" % (e.status, e.error_msg)
+
         if 'contents' not in response:
             raise FuseOSError(errno.EIO) # IO error
 
@@ -69,8 +109,8 @@ class DropboxAPI():
         for child in response['contents']:
             # utf8 encoding will handle special characters
             name = str((os.path.basename(child['path'])).encode('utf8'))
-
             d = child['modified']
+
             # format date string
             d = d[5:-6]
             date_object = datetime.strptime(d, '%d %b %Y %H:%M:%S')
@@ -91,20 +131,41 @@ class DropboxAPI():
             self.tree_contents[path][name] = {'name': name, 'type': obj_type, \
                     'size': child['bytes'], 'ctime': ctime, 'mtime': mtime}
 
+        # update expiration time
+        self.tree_contents_cache[path] = time() + ttl
+
         return self.tree_contents[path]
 
 class DropboxFUSE(LoggingMixIn):
 
-    def __init__(self, mountpoint, logfile=None):
+    def __init__(self, mountpoint, restr_dir):
         self.dropbox_api = DropboxAPI()
-        self.logfile = logfile
         self.files = {}
         self.full_path = ''
         self.mountpoint = mountpoint
-        self.extensions = ['.class'] # list of restricted file extensions
+        self.restr_dir = restr_dir
+        self.restr_files = {}
+        self.extensions = ['.ascii', '.class'] # list of restricted file extensions
 
     # Helper functions
     # ================
+
+    def create_restr_dir(self):
+
+        # this is where local restricted files will be stored
+        root_dir = os.getcwd()
+        restr_dir = os.path.join(root_dir, self.restr_dir)
+
+        if not os.path.exists(restr_dir):
+            os.mkdir(restr_dir, 0755)
+
+    def get_restr_path(self, path):
+
+        name = os.path.basename(path)
+        root_dir = os.getcwd()
+        restr_file = os.path.join(self.restr_dir, name)
+        restr_path = os.path.join(root_dir, restr_file)
+        return restr_path
 
     def get_full_path(self, path):
 
@@ -113,32 +174,45 @@ class DropboxFUSE(LoggingMixIn):
         path = "%s%s" % (mnt_dir[:-1], path)
         return path
 
-    def file_get(self, path, download=True):
+    def file_get(self, path, download=True): 
+
+        if path in self.restr_files:
+            print "file_get: %s is in self.restr_files" % path
+            return self.restr_files[path]
+
         if path in self.files:
             print "file_get: %s is in self.files" % path
             return self.files[path]
-
-        # Temp file stores all files in /tmp dir
-        # f.name gives the name of temp file
+        
+        # tempfile stores all files in /tmp
         # generate temp file
         f = tempfile.NamedTemporaryFile()
 
-        if download == True: # if download is true
+        if download == True:
             # get file from dropbox
-            print "download=true ", f.name
-            raw = self.dropbox_api.client.get_file(path)
-            # Read data off the underlying socket
-            # and write the bytes to temp file
-            f.write(raw.read())
-            raw.close() # Close the underlying socket
+            try:
+                raw = self.dropbox_api.client.get_file(path)
+                # Read data off the underlying socket
+                # and write the bytes to temp file
+                f.write(raw.read())
+                raw.close() # Close the underlying socket
+            except ErrorResponse, e:
+                print "Download Error %s: %s" % (e.status, e.error_msg)
+        
+        elif download == None:
+            # create or edit restricted file
+            f_descr = os.open(path, os.O_RDWR|os.O_CREAT, 0664)
+
+            # populate dict with restricted file descriptor
+            self.restr_files[path] = {'file_descriptor': f_descr}                
+            return self.restr_files[path]
+
         else:
-            # new file is created
-            print "download=false ", f.name
             raw = ''
             # create empty temp file
             f.write(raw)
 
-        # populate dict with objects read
+        # populate dict with file object
         self.files[path] = {'object': f, 'modified': False}
         return self.files[path]
 
@@ -148,7 +222,12 @@ class DropboxFUSE(LoggingMixIn):
             self.files[newFile] = self.files[oldFile] # update name of old file
             del self.files[oldFile] # delete old file
 
-    def file_close(self, path): # file gets uploaded before its closed 
+        if oldFile in self.restr_files:
+            self.restr_files[newFile] = self.restr_files[oldFile]
+            del self.restr_files[oldFile]
+
+    def file_close(self, path): # file gets uploaded before its closed
+
         if path in self.files:
             if self.files[path]['modified'] == True: #if file is altered
                 self.file_upload(path)
@@ -160,8 +239,8 @@ class DropboxFUSE(LoggingMixIn):
 
     def file_upload(self, path):
 
-        print 'entered file upload'
-
+        print 'file upload %s' % path
+        
         if path not in self.files:
             raise FuseOSError(errno.EIO) # IO error
 
@@ -178,29 +257,28 @@ class DropboxFUSE(LoggingMixIn):
         # open for writing before it gets uploaded to remote storage
         ff = open(tfName, "rw+")
 
-        restrict = self.restrictFile(path)
-        if restrict == False:
-            # upload file object
+        # upload file object
+        try:
             response = self.dropbox_api.client.put_file(path, ff, overwrite=True)
-            print "uploaded: ", response
-            # trap any errors
-            if response['rev'] == []:
-                raise FuseOSError(errno.EIO) # IO error
-        else:
-            print "file %s restricted for upload " % path
-            #name = os.path.basename(path)
-            #response = self.dropbox_api.tree_contents[os.path.dirname(path)][name]
-            #ff.seek(0)
-            #rf = open(tfName, "r+")
-            #ff.write('hello')
-            #print "rf: ", rf
-            #rf.close()       
+        except ErrorResponse, e:
+            print "Upload Error %s: %s" % (e.status, e.error_msg)
 
+        print "uploaded: ", response
+        # trap any errors
+        if response['rev'] == []:
+            raise FuseOSError(errno.EIO) # IO error
+
+        ff.close() # close the file that got uploaded
         fileObject['modified'] = False
+            
 
     def create_directory(self, path):
 
-        new_dir = self.dropbox_api.client.file_create_folder(path)
+        try:
+            new_dir = self.dropbox_api.client.file_create_folder(path)
+        except ErrorResponse, e:
+            print "Error %s: %s" % (e.status, e.error_msg)
+
         if path not in self.files:
             self.files[path] = new_dir
 
@@ -209,10 +287,9 @@ class DropboxFUSE(LoggingMixIn):
         if path in self.files:
             del self.files[path] # delete object from dictionary
 
-
     def restrictFile(self, path):
 
-        """restricts a file being synchronised based on its extension"""
+        """stops a file being synchronised based on its extension"""
 
         # get file name and file extension
         fileName, fileExtension = os.path.splitext(path)
@@ -238,34 +315,54 @@ class DropboxFUSE(LoggingMixIn):
 
         """
         Defining this method is mandatory for a working filesystem
-        Returns an object with the listed attributes
-        The files and the associated data is stored as a Python dictionary
+        Returns a stat() structure
+        The files and the associated data is stored as a dictionary
         """
 
-        self.full_path = self.get_full_path(path)
+        # get fuse context
+        (uid, gid, pid) = fuse_get_context()
+
+        stat_result = { "st_mtime": time(), # modified time
+                        "st_ctime": time(), # changed time
+                        "st_atime": time(), # last access time
+                        "st_uid": uid,      # user id
+                        "st_gid": gid }     # group id
 
         if path == '/':
-            st = dict(st_mode=(stat.S_IFDIR | 0755), st_nlink=2)
-            st['st_ctime'] = st['st_atime'] = st['st_mtime'] = time.time()
-            st['st_uid'] = os.getuid()
-            st['st_gid'] = os.getgid()
+            #stat_result["st_size"] = 1024 * 4 # default size should be 4K
+            stat_result['st_mode'] = (stat.S_IFDIR | 0755)
+            stat_result['st_nlink'] = 2
         else:
             name = str(os.path.basename(path))
+            # if a restricted file at restr_path, retrieve its metadata
+            if name[name.rfind('.'):] in self.extensions:
+
+                restr_path = self.get_restr_path(path)
+                st = os.lstat(restr_path)
+
+                return dict((key, getattr(st, key)) for key in ('st_atime', 'st_ctime',
+                     'st_gid', 'st_mode', 'st_mtime', 'st_nlink', 'st_size', 'st_uid'))
+
+            # get files and directories metadata from dropbox
             objects = self.dropbox_api.list_objects(os.path.dirname(path))
 
             if name not in objects:
-                raise FuseOSError(errno.ENOENT) #No such file or directory
+                raise FuseOSError(errno.ENOENT) # no such file or directory
             elif objects[name]['type'] == 'file':
-                st = dict(st_mode=(stat.S_IFREG | 0644), st_nlink=1, st_size=int(objects[name]['size']))
+                stat_result['st_size'] = int(objects[name]['size'])
+                stat_result['st_mode'] = (stat.S_IFREG | 0644)
+                stat_result['st_nlink'] = 1
             else:
-                st = dict(st_mode=(stat.S_IFDIR | 0755), st_nlink=2)
+                # theres an issue with dropbox metadata api call
+                # it always returns 0 bytes for folder size
+                #stat_result["st_size"] = int(objects[name]['size'])
+                stat_result['st_mode'] = (stat.S_IFDIR | 0755)
+                stat_result['st_nlink'] = 2
 
-            st['st_ctime'] = st['st_atime'] = objects[name]['ctime']
-            st['st_mtime'] = objects[name]['mtime']
-            st['st_uid'] = os.getuid()
-            st['st_gid'] = os.getgid()
+            stat_result['st_ctime'] = stat_result['st_atime'] = objects[name]['ctime']
+            stat_result['st_mtime'] = objects[name]['mtime']
 
-        return st
+        return stat_result
 
     def readdir(self, path, fh):
         """
@@ -274,12 +371,24 @@ class DropboxFUSE(LoggingMixIn):
         Returns: Directory listing for 'ls' command
         """
         #print "readdir: " + path
-        objects = self.dropbox_api.list_objects(path)
 
+        restr_path = self.get_restr_path(path)
+        restr_objects = []
+
+        objects = self.dropbox_api.list_objects(path)
+        if os.path.isdir(restr_path):
+            restr_objects = os.listdir(restr_path)
+
+        #objects.update(restr_objects)
         listing = ['.', '..']
         for f in objects:
             listing.append(f)
+
+        for f in restr_objects:
+            listing.append(f)
+
         return listing
+
 
     def mkdir(self, path, mode):
 
@@ -290,7 +399,10 @@ class DropboxFUSE(LoggingMixIn):
 
         print "removing directory %s" % path
         self.object_delete(path)
-        self.dropbox_api.client.file_delete(path)
+        try:
+            self.dropbox_api.client.file_delete(path)
+        except ErrorResponse, e:
+            print "Error %s: %s" % (e.status, e.error_msg)
 
     def unlink(self, path):
 
@@ -298,17 +410,43 @@ class DropboxFUSE(LoggingMixIn):
     	Should remove the filesystem object at path
         It may have any type except for directory
     	"""
-    	print "removing file %s" % path
-        self.object_delete(path)
-        self.dropbox_api.client.file_delete(path)
+
+        restrict = self.restrictFile(path)
+        
+        if restrict == False:
+            print "removing file %s" % path
+            self.object_delete(path)
+            try:
+                self.dropbox_api.client.file_delete(path)
+            except ErrorResponse, e:
+                print "Error %s: %s" % (e.status, e.error_msg)
+        
+        else:
+            restr_path = self.get_restr_path(path)
+            print "removing file %s" % restr_path
+            os.unlink(restr_path)
 
     def rename(self, oldFile, newFile):
         
-        print "renaming: " + oldFile + " to " + newFile
-        self.file_rename(oldFile, newFile)
-        self.dropbox_api.client.file_move(oldFile, newFile)
+        restrict = self.restrictFile(oldFile)
 
-    # Not supported operations. The system doesn't fit within this model.
+        if restrict == False:
+            print "renaming: " + oldFile + " to " + newFile
+            self.file_rename(oldFile, newFile)
+            try:
+                self.dropbox_api.client.file_move(oldFile, newFile)
+            except ErrorResponse, e:
+                print "Error %s: %s" % (e.status, e.error_msg)
+
+        else:
+            old_file = self.get_restr_path(oldFile)
+            restr_dir = os.path.join(os.getcwd(), self.restr_dir)
+            new_file = os.path.join(restr_dir, newFile[1:])
+            print "renaming: " + old_file + " to " + new_file
+            self.file_rename(old_file, new_file)
+            os.rename(old_file, new_file)
+
+    """ Not supported operations. The system doesn't fit within this model """
     
     def chmod(self, path, mode):
         
@@ -338,56 +476,85 @@ class DropboxFUSE(LoggingMixIn):
         Returns: Pointer to file
         """
 
-        print "opening file %s" % path
-
         restrict = self.restrictFile(path)
+
         if restrict == False:
+            print "opening file %s" % path
             self.file_get(path)
         else:
-            os.open(self.full_path, flags)
+            restr_path = self.get_restr_path(path)
+            print "opening file %s" % restr_path
+            self.file_get(restr_path, download=None)
 
         return 0
 
     def read(self, path, size, offset, fh):
-    
+        
         # returns bytes read
-        print "reading file %s" % path
-        f = self.file_get(path)['object']
-        f.seek(offset)
-        buf = f.read(size)
-        return buf
-    
-    def write(self, path, buf, offset=0, fh=None):
+        restrict = self.restrictFile(path)
 
-        print "writing to file %s" % path
-        fileObject = self.file_get(path) # get file object
-        f = fileObject['object']
-        f.seek(offset) # set the file's current position
-        fileObject['modified'] = True # file is modified
-        f.write(buf) # write a string to the file
-        return len(buf) # return number of bytes written
+        if restrict == False:
+            print "reading file %s" % path
+            f = self.file_get(path)['object']
+            f.seek(offset)
+            buf = f.read(size)
+            return buf
+        else:
+            restr_path = self.get_restr_path(path)
+            print "reading file %s" % restr_path
+            fid = self.file_get(restr_path, download=None)['file_descriptor']
+            os.lseek(fid, offset, os.SEEK_SET)
+            return os.read(fid, size)
+
+    def write(self, path, buf, offset, fh):
+
+        restrict = self.restrictFile(path)
+
+        if restrict == False:
+            print "writing to file %s" % path
+            fileObject = self.file_get(path) # get file object
+            f = fileObject['object']
+            f.seek(offset) # set the file's current position
+            fileObject['modified'] = True # file is modified
+            f.write(buf) # write a string to the file
+            return len(buf) # return number of bytes written
+        else:
+            restr_path = self.get_restr_path(path)
+            print "writing to file %s" % restr_path
+            fid = self.file_get(restr_path, download=None)['file_descriptor']
+            os.lseek(fid, offset, os.SEEK_SET)
+            return os.write(fid, buf)
 
     def truncate(self, path, length, fh=None):
         
         # shrink or extend the size of a file to the specified size
-        print "truncate: " + path
-        f = self.file_get(path)['object']
-        f.truncate(length)
+        restrict = self.restrictFile(path)
+
+        if restrict == False:
+            print "truncate: " + path
+            f = self.file_get(path)['object']
+            f.truncate(length)
+        else:
+            restr_path = self.get_restr_path(path)
+            print "truncate: " + restr_path
+            fid = self.file_get(restr_path, download=None)['file_descriptor']
+            os.ftruncate(fid, length)
 
     def create(self, path, mode):
         
-        print "create: " + path
         name = os.path.basename(path) # return file name
         restrict = self.restrictFile(path)
 
-        print "self.full_path", self.full_path
+        # handle vim .swp and [filename]~ files
+        # dont create and upload those
+        if name[0] != '.' and name != '4913' and name[-1:] != '~' and restrict == False:
 
-        if name[0] != '.' and restrict == False:
+            print "create: " + path
             # check if the directory is in the current directory tree
             # if it is, add the new file with the proper name and path 
             if os.path.dirname(path) in self.dropbox_api.tree_contents:
                 self.dropbox_api.tree_contents[os.path.dirname(path)][name] = {'name': name, \
-                        'type': 'file', 'size': 0, 'ctime': time.time(), 'mtime': time.time()}
+                        'type': 'file', 'size': 0, 'ctime': time(), 'mtime': time()}
                 print "tree_contents: ", self.dropbox_api.tree_contents[os.path.dirname(path)][name] 
             
             fileObject = self.file_get(path, download=False) # get file object
@@ -398,31 +565,73 @@ class DropboxFUSE(LoggingMixIn):
             self.file_upload(path)
 
         elif name[0] != '.' and restrict == True:
-            print "creating restricted file"
-     
-            #os.open(self.full_path, os.O_RDWR | os.O_CREAT)
+
+            # create dir where restricted file will be saved
+            self.create_restr_dir()
+            print "creating restricted file %s" % path
+
+            restr_path = self.get_restr_path(path)
+            print "create: " + restr_path
+            fileObject = self.file_get(restr_path, download=None)
 
         return 0
 
     def release(self, path, fh):
 
-        print "release: " + path
-        self.file_close(path)
+        restrict = self.restrictFile(path)
+
+        if restrict == False:
+            print "release: " + path
+            self.file_close(path)
+        else:
+            restr_path = self.get_restr_path(path)
+            print "release: " + restr_path
+            fid = self.file_get(restr_path, download=None)['file_descriptor']
+            del self.restr_files[restr_path]
+            os.close(fid)
 
     def flush(self, path, fh):
-        print "flush: " + path
-        if path in self.files:
-            if self.files[path]['modified'] == True:
-                self.file_upload(path)
+
+        # called on each close
+        restrict = self.restrictFile(path)
+
+        if restrict == False:
+            print "flush: " + path
+            if path in self.files:
+                if self.files[path]['modified'] == True:
+                    self.file_upload(path)
+        else:
+            restr_path = self.get_restr_path(path)
+            print "flush: " + restr_path
+            fid = self.file_get(restr_path, download=None)['file_descriptor']
+            os.fsync(fid)
 
     def fsync(self, path, datasync, fh):
-        print "fsync: " + path
-        if path in self.files:
-            if self.files[path]['modified'] == True:
-                self.file_upload(path)
+        
+        # flush any dirty information about the file to disk
+        restrict = self.restrictFile(path)
 
-def main(mountpoint):
-    fuse = FUSE(DropboxFUSE(mountpoint), mountpoint, foreground=True)
+        if restrict == False:
+            print "fsync: " + path
+            if path in self.files:
+                if self.files[path]['modified'] == True:
+                    self.file_upload(path)
+        else:
+            restr_path = self.get_restr_path(path)
+            print "fsync: " + restr_path
+            fid = self.file_get(restr_path, download=None)['file_descriptor']
+            self.flush(restr_path, fid)
+
+def main(mountpoint, restr_dir):
+
+    fuse = FUSE(DropboxFUSE(mountpoint, restr_dir), \
+            mountpoint, noatime=True, foreground=True)
 
 if __name__ == '__main__':
-    main(sys.argv[1])
+
+    if len(sys.argv) != 3:
+        print "Wrong number of parameters."
+        print "Usage: dropbox_fuse.py <mount_point> <restr_dir>"
+        exit()
+
+    main(sys.argv[1], sys.argv[2])
