@@ -6,9 +6,10 @@ import stat
 import errno
 import pprint
 import tempfile
+import socket
 import dropbox
 from dropbox.rest import ErrorResponse
-from config import AppCredentials # the file where app_secret and app_key are stored
+from config import AppCredentials # app_secret and app_key
 from time import time
 from threading import Lock
 from datetime import datetime
@@ -87,6 +88,22 @@ class DropboxAPI():
         return files
     """
 
+    def upload_f_perm(self):
+
+        # if permissions file doesnt exist,
+        # create it and upload to dropbox
+        f = open('.f_perm.txt', 'a+')
+        res = self.client.put_file('/.f_perm.txt', f, overwrite=True)
+        f.close()
+
+    def search(self, values, searchFor):
+
+        # search for specific path in metadata dict
+        for k in values['contents']:
+            if searchFor in k['path']:
+                return True
+        return False
+
     def list_objects(self, path, ttl=10):
 
         # for efficiency check cache
@@ -94,6 +111,12 @@ class DropboxAPI():
         if path in self.tree_contents_cache:
             if self.tree_contents_cache[path] >= time():
                 return self.tree_contents[path]
+
+        # check if dropbox api host is accessible
+        try:
+            host = socket.getaddrinfo('api.dropbox.com', 443)
+        except socket.gaierror, err:
+            print "Cannot resolve hostname: ", 'api.dropbox.com', err
 
         try:
             # obtain file/folder metadata from dropbox
@@ -131,6 +154,26 @@ class DropboxAPI():
             self.tree_contents[path][name] = {'name': name, 'type': obj_type, \
                     'size': child['bytes'], 'ctime': ctime, 'mtime': mtime}
 
+        db_api = DropboxAPI()
+        #Check if permissions file exists locally & on dropbox
+        is_existent = db_api.search(response, '/.f_perm.txt')
+        
+        if not is_existent:
+            db_api.upload_f_perm() 
+        elif not os.path.isfile('.f_perm.txt'):
+            f = open('.f_perm.txt', 'a+')
+            try:
+                perm = self.client.get_file('/.f_perm.txt')
+                perm_contents = perm.read()
+                perm.close()
+            except ErrorResponse, e:
+                print "Error %s: %s" % (e.status, e.error_msg)
+            lines = perm_contents.split('\n')
+            for i in range(len(lines)-1):
+                line = lines[i]
+                f.write("%s\n" % (line))
+            f.close()
+
         # update expiration time
         self.tree_contents_cache[path] = time() + ttl
 
@@ -141,11 +184,10 @@ class DropboxFUSE(LoggingMixIn):
     def __init__(self, mountpoint, restr_dir):
         self.dropbox_api = DropboxAPI()
         self.files = {}
-        self.full_path = ''
         self.mountpoint = mountpoint
         self.restr_dir = restr_dir
         self.restr_files = {}
-        self.extensions = ['.ascii', '.class'] # list of restricted file extensions
+        self.extensions = ['.ascii', '.class', '.log'] # restricted file extensions
 
     # Helper functions
     # ================
@@ -197,7 +239,7 @@ class DropboxFUSE(LoggingMixIn):
                 f.write(raw.read())
                 raw.close() # Close the underlying socket
             except ErrorResponse, e:
-                print "Download Error %s: %s" % (e.status, e.error_msg)
+                print "Error %s: %s" % (e.status, e.error_msg)
         
         elif download == None:
             # create or edit restricted file
@@ -271,7 +313,6 @@ class DropboxFUSE(LoggingMixIn):
         ff.close() # close the file that got uploaded
         fileObject['modified'] = False
             
-
     def create_directory(self, path):
 
         try:
@@ -289,7 +330,8 @@ class DropboxFUSE(LoggingMixIn):
 
     def restrictFile(self, path):
 
-        """stops a file being synchronised based on its extension"""
+        # distinguish between dropbox file and local "restricted" file
+        # stops a file being synchronised based on its extension
 
         # get file name and file extension
         fileName, fileExtension = os.path.splitext(path)
@@ -332,6 +374,7 @@ class DropboxFUSE(LoggingMixIn):
             #stat_result["st_size"] = 1024 * 4 # default size should be 4K
             stat_result['st_mode'] = (stat.S_IFDIR | 0755)
             stat_result['st_nlink'] = 2
+
         else:
             name = str(os.path.basename(path))
             # if a restricted file at restr_path, retrieve its metadata
@@ -348,9 +391,41 @@ class DropboxFUSE(LoggingMixIn):
 
             if name not in objects:
                 raise FuseOSError(errno.ENOENT) # no such file or directory
+
             elif objects[name]['type'] == 'file':
                 stat_result['st_size'] = int(objects[name]['size'])
-                stat_result['st_mode'] = (stat.S_IFREG | 0644)
+
+                """
+                perm = self.dropbox_api.client.get_file('/.f_perm.txt')
+                perm_contents = perm.read()
+                perm.close()
+
+                if path not in perm_contents:
+                    # file gets default permission
+                    stat_result['st_mode'] = (stat.S_IFREG | 0644)
+                else:
+                    # file gets permission bits from f_perm file
+                    lines = perm_contents.split('\n')
+                    for i in range(len(lines)-1):
+                        line = lines[i]
+                        p = line.split()[0]
+                        if p == path:
+                            stat_result['st_mode'] = int(line.split()[1])
+
+                """
+
+                if path not in open('.f_perm.txt').read():
+                    # file gets default permission
+                    stat_result['st_mode'] = (stat.S_IFREG | 0644)
+                else:
+                    # file gets permission bits from f_perm file
+                    with open('.f_perm.txt', 'r') as f: 
+                        lines = f.readlines()
+                    for line in lines:
+                        p = line.split()[0]
+                        if p == path:
+                            stat_result['st_mode'] = int(line.split()[1])
+
                 stat_result['st_nlink'] = 1
             else:
                 # theres an issue with dropbox metadata api call
@@ -379,7 +454,6 @@ class DropboxFUSE(LoggingMixIn):
         if os.path.isdir(restr_path):
             restr_objects = os.listdir(restr_path)
 
-        #objects.update(restr_objects)
         listing = ['.', '..']
         for f in objects:
             listing.append(f)
@@ -388,7 +462,6 @@ class DropboxFUSE(LoggingMixIn):
             listing.append(f)
 
         return listing
-
 
     def mkdir(self, path, mode):
 
@@ -446,14 +519,67 @@ class DropboxFUSE(LoggingMixIn):
             self.file_rename(old_file, new_file)
             os.rename(old_file, new_file)
 
-    """ Not supported operations. The system doesn't fit within this model """
-    
     def chmod(self, path, mode):
         
-        raise FuseOSError(errno.EPERM) # Operation not permitted
+        # change the access mode of a file
+        restrict = self.restrictFile(path)
+
+        if restrict == False:
+            # handle permissions for dropbox files
+            st_mode = (stat.S_IFREG | mode)
+            # get octal value for file current permission
+            st_mode_oct = oct(st_mode & 0777)
+
+            try:
+                perm = self.dropbox_api.client.get_file('/.f_perm.txt')
+                perm_contents = perm.read()
+                perm.close()
+            except ErrorResponse, e:
+                print "Error %s: %s" % (e.status, e.error_msg)
+
+            if not os.path.isfile('.f_perm.txt') and perm_contents == '':
+                f_perm = open('.f_perm.txt', 'a+')
+                f_perm.close()
+
+            elif not os.path.isfile('.f_perm.txt') and perm_contents != '':
+                f_perm = open('.f_perm.txt', 'a+')
+                lines = perm_contents.split('\n')
+                for i in range(len(lines)-1):
+                    line = lines[i]
+                    f_perm.write("%s\n" % (line))
+                    f_perm.close()
+
+            else:
+                f_perm = open('.f_perm.txt', 'a+')
+                if path not in open('.f_perm.txt').read():
+                    # if not default permission (0644), add new entry
+                    if st_mode != 33188:
+                        f_perm.write("%s    %s    %s\n" % (path, st_mode, st_mode_oct))
+                        f_perm.close()
+                        self.dropbox_api.upload_f_perm()
+
+                else:
+                    # remove the entry & write fresh value
+                    lines = f_perm.readlines()
+                    f_perm.close()
+                    with open('.f_perm.txt', 'w') as f:
+                        for line in lines:
+                            p = line.split()[0]
+                            if p != path:
+                                f.write(line)
+                        f.write("%s    %s    %s\n" % (path, st_mode, st_mode_oct))
+                    self.dropbox_api.upload_f_perm()
+
+        else:
+            # restricted file
+            restr_path = self.get_restr_path(path)
+            return os.chmod(restr_path, mode) 
+
+
+    """ Not supported operations. The system doesn't fit within this model """
         
     def chown(self, path, uid, gid):
-        
+        # change the owner of a file or directory
         raise FuseOSError(errno.EPERM) # Operation not permitted
 
     def symlink(self, target, name):
