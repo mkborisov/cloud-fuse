@@ -31,7 +31,6 @@ class DropboxAPI():
 
         if token_secret != '':
             client = dropbox.client.DropboxClient(str(token_secret))
-
         else:
             #log in and authenticate with dropbox
             flow = dropbox.client.DropboxOAuth2FlowNoRedirect(AppCredentials.app_key, \
@@ -43,9 +42,16 @@ class DropboxAPI():
             print '3. Copy the authorization code.'
             
             code = raw_input("Enter the authorization code here: ").strip()
-            access_token, user_id = flow.finish(code)
+            try:
+                access_token, user_id = flow.finish(code)
+            except ErrorResponse, e:
+                print "Error %s: %s" % (e.status, e.error_msg)
+                print
+                self.dropbox_request()
+                return
+
             client = dropbox.client.DropboxClient(access_token)
-            
+
             # write the access_token to file for reuse
             token_file = open(app_access_token,'w')
             token_file.write("%s" % (access_token))
@@ -58,35 +64,6 @@ class DropboxAPI():
         #returns the account information, such as user's display name, quota, email, etc
         acc_info = self.client.account_info()
         pprint.PrettyPrinter(indent = 2).pprint(acc_info)
-
-    """
-    def get_all_metadata(self, path, files=None, cursor=None):
-
-        if files is None:
-            files = {}
-
-        cursor = None
-        has_more = True
-
-        while has_more:
-            response = self.client.delta(cursor, path)
-            cursor = response['cursor']
-            has_more = response['has_more']
-
-            if 'entries' not in response:
-                raise FuseOSError(errno.EIO) # IO error
-
-            for file_path, metadata in response['entries']:
-
-                if metadata is not None:
-                    files[file_path] = metadata
-                    #print metadata
-                    print
-                    print file_path
-                    print "====================="
-
-        return files
-    """
 
     def upload_f_perm(self):
 
@@ -106,8 +83,8 @@ class DropboxAPI():
 
     def list_objects(self, path, ttl=10):
 
-        # for efficiency check cache
-        # caching prevents calling metadata() constantly
+        # for efficiency, store last snapshot of files in memory
+        # this prevents calling metadata() constantly
         if path in self.tree_contents_cache:
             if self.tree_contents_cache[path] >= time():
                 return self.tree_contents[path]
@@ -176,7 +153,6 @@ class DropboxAPI():
 
         # update expiration time
         self.tree_contents_cache[path] = time() + ttl
-
         return self.tree_contents[path]
 
 class DropboxFUSE(LoggingMixIn):
@@ -209,12 +185,14 @@ class DropboxFUSE(LoggingMixIn):
         restr_path = os.path.join(root_dir, restr_file)
         return restr_path
 
+    """
     def get_full_path(self, path):
 
         root_dir = os.getcwd()
         mnt_dir = os.path.join(root_dir, self.mountpoint)
         path = "%s%s" % (mnt_dir[:-1], path)
         return path
+    """
 
     def file_get(self, path, download=True): 
 
@@ -320,6 +298,11 @@ class DropboxFUSE(LoggingMixIn):
         except ErrorResponse, e:
             print "Error %s: %s" % (e.status, e.error_msg)
 
+        # update tree_contents
+        name = os.path.basename(path)
+        self.dropbox_api.tree_contents[os.path.dirname(path)][name] = \
+            {'name': name, 'type': 'dir', 'size': 0, 'ctime': time(), 'mtime': time()}
+
         if path not in self.files:
             self.files[path] = new_dir
 
@@ -360,7 +343,7 @@ class DropboxFUSE(LoggingMixIn):
         Returns a stat() structure
         The files and the associated data is stored as a dictionary
         """
-
+        
         # get fuse context
         (uid, gid, pid) = fuse_get_context()
 
@@ -376,6 +359,7 @@ class DropboxFUSE(LoggingMixIn):
             stat_result['st_nlink'] = 2
 
         else:
+
             name = str(os.path.basename(path))
             # if a restricted file at restr_path, retrieve its metadata
             if name[name.rfind('.'):] in self.extensions:
@@ -394,25 +378,6 @@ class DropboxFUSE(LoggingMixIn):
 
             elif objects[name]['type'] == 'file':
                 stat_result['st_size'] = int(objects[name]['size'])
-
-                """
-                perm = self.dropbox_api.client.get_file('/.f_perm.txt')
-                perm_contents = perm.read()
-                perm.close()
-
-                if path not in perm_contents:
-                    # file gets default permission
-                    stat_result['st_mode'] = (stat.S_IFREG | 0644)
-                else:
-                    # file gets permission bits from f_perm file
-                    lines = perm_contents.split('\n')
-                    for i in range(len(lines)-1):
-                        line = lines[i]
-                        p = line.split()[0]
-                        if p == path:
-                            stat_result['st_mode'] = int(line.split()[1])
-
-                """
 
                 if path not in open('.f_perm.txt').read():
                     # file gets default permission
@@ -438,6 +403,7 @@ class DropboxFUSE(LoggingMixIn):
             stat_result['st_mtime'] = objects[name]['mtime']
 
         return stat_result
+
 
     def readdir(self, path, fh):
         """
