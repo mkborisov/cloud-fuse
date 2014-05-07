@@ -84,7 +84,7 @@ class DropboxAPI():
 
         # for efficiency, store the last snapshot of files in memory
         # this prevents from constantly calling metadata()
-        if path in self.tree_contents_cache and ttl != 0:
+        if path in self.tree_contents_cache:
             if self.tree_contents_cache[path] >= time():
                 return self.tree_contents[path]
 
@@ -157,7 +157,6 @@ class DropboxAPI():
 class DropboxFUSE(LoggingMixIn):
 
     # The main filesystem class. Most work will be done in here
-
     def __init__(self, mountpoint, restr_dir):
         self.dropbox_api = DropboxAPI()
         self.files = {}
@@ -219,7 +218,9 @@ class DropboxFUSE(LoggingMixIn):
                 raw.close() # Close the underlying socket
             except ErrorResponse, e:
                 print "Error %s: %s" % (e.status, e.error_msg)
-        
+                if e.status == 404:
+                    raise FuseOSError(errno.ENOENT) # no such file or dir
+
         elif download == None:
             # create or edit restricted file
             f_descr = os.open(path, os.O_RDWR|os.O_CREAT, 0664)
@@ -254,7 +255,6 @@ class DropboxFUSE(LoggingMixIn):
                 self.file_upload(path)
 
             print "closing: " + path
-
             self.files[path]['object'].close()
             del self.files[path]
 
@@ -288,7 +288,7 @@ class DropboxFUSE(LoggingMixIn):
         name = os.path.basename(path)
         if os.path.dirname(path) in self.dropbox_api.tree_contents:
             self.dropbox_api.tree_contents[os.path.dirname(path)][name] = \
-                {'name': name, 'type': 'file', 'size': response['size'].split(" ")[0], \
+                {'name': name, 'type': 'file', 'size': response['bytes'], \
                     'ctime': time(), 'mtime': time()}
 
         print "FILE UPLOADED"
@@ -296,7 +296,7 @@ class DropboxFUSE(LoggingMixIn):
         if response['rev'] == []:
             raise FuseOSError(errno.EIO) # IO error
 
-        ff.close() # close the file that got uploaded
+        #ff.close() # close the file that got uploaded
         fileObject['modified'] = False
             
     def create_directory(self, path):
@@ -320,14 +320,13 @@ class DropboxFUSE(LoggingMixIn):
     def object_delete(self, path):
 
         if path in self.files:
-            del self.files[path] # delete object from dictionary
+            del self.files[path] # delete object from dict
 
     def restrictFile(self, path):
 
         # distinguish between dropbox file and local "restricted" file
         # stops a file being synchronised based on its extension
 
-        # get file name and file extension
         fileName, fileExtension = os.path.splitext(path)
         if fileExtension not in self.extensions:
             return False
@@ -370,7 +369,6 @@ class DropboxFUSE(LoggingMixIn):
             stat_result['st_nlink'] = 2
 
         else:
-
             name = str(os.path.basename(path))
             # if a restricted file at restr_path, retrieve its metadata
             if name[name.rfind('.'):] in self.extensions:
@@ -388,7 +386,7 @@ class DropboxFUSE(LoggingMixIn):
                 raise FuseOSError(errno.ENOENT) # no such file or directory
 
             elif objects[name]['type'] == 'file':
-                stat_result['st_size'] = int(objects[name]['size'])
+                stat_result['st_size'] = objects[name]['size']
 
                 if path not in open('.f_perm.txt').read():
                     # file gets default permission
@@ -453,14 +451,17 @@ class DropboxFUSE(LoggingMixIn):
 
         print "removing directory %s" % path
 
-        if path not in self.files:
-            raise FuseOSError(errno.ENOENT) # no such file/dir
-
         self.object_delete(path)
         try:
             self.dropbox_api.client.file_delete(path)
         except ErrorResponse, e:
             print "Error %s: %s" % (e.status, e.error_msg)
+            raise FuseOSError(errno.ENOENT) # no such dir
+
+        # update tree_contents
+        name = os.path.basename(path)
+        if os.path.dirname(path) in self.dropbox_api.tree_contents:
+            del self.dropbox_api.tree_contents[os.path.dirname(path)][name]
 
     def unlink(self, path):
 
@@ -468,11 +469,8 @@ class DropboxFUSE(LoggingMixIn):
     	Should remove the filesystem object at path
         It may have any type except for directory
     	"""
-        restrict = self.restrictFile(path)
-        if restrict == False:
-
-            if path not in self.files:
-                raise FuseOSError(errno.ENOENT) # no such file
+        restricted = self.restrictFile(path)
+        if not restricted:
 
             print "removing dropbox file %s" % path
             self.object_delete(path)
@@ -480,11 +478,12 @@ class DropboxFUSE(LoggingMixIn):
                 self.dropbox_api.client.file_delete(path)
             except ErrorResponse, e:
                 print "Error %s: %s" % (e.status, e.error_msg)
+                raise FuseOSError(errno.ENOENT) # no such file
 
             # update tree_contents
             name = os.path.basename(path)
             del self.dropbox_api.tree_contents[os.path.dirname(path)][name]
-                
+
         else:
             restr_path = self.get_restr_path(path)
             print "removing file %s" % restr_path
@@ -492,20 +491,20 @@ class DropboxFUSE(LoggingMixIn):
 
     def rename(self, oldFile, newFile):
         
-        if oldFile not in self.files:
-            raise FuseOSError(errno.ENOENT) # no such file
-        elif oldFile == newFile:
+        if oldFile == newFile:
             raise FuseOSError(errno.EEXIST) # file exists
 
-        restrict = self.restrictFile(oldFile)
+        restricted = self.restrictFile(oldFile)
         response = {}
-        if restrict == False:
+        if not restricted:
             print "renaming: " + oldFile + " to " + newFile
             self.file_rename(oldFile, newFile)
             try:
                 response = self.dropbox_api.client.file_move(oldFile, newFile)
             except ErrorResponse, e:
                 print "Error %s: %s" % (e.status, e.error_msg)
+                if e.status == 404:
+                    raise FuseOSError(errno.ENOENT) # no such file or dir
 
             # update tree_contents
             name = os.path.basename(oldFile)
@@ -531,8 +530,8 @@ class DropboxFUSE(LoggingMixIn):
     def chmod(self, path, mode):
         
         # change the access mode of a file
-        restrict = self.restrictFile(path)
-        if restrict == False:
+        restricted = self.restrictFile(path)
+        if not restricted:
             # handle permissions for dropbox files
             st_mode = (stat.S_IFREG | mode)
             # get octal value for file current permission
@@ -583,7 +582,6 @@ class DropboxFUSE(LoggingMixIn):
             restr_path = self.get_restr_path(path)
             return os.chmod(restr_path, mode) 
 
-
     """ Unsupported operations. The system doesn't fit within this model """
         
     def chown(self, path, uid, gid):
@@ -609,9 +607,8 @@ class DropboxFUSE(LoggingMixIn):
         flags: String giving Read/Write/Append Flags to apply to file
         Returns: Pointer to file
         """
-
-        restrict = self.restrictFile(path)
-        if restrict == False:
+        restricted = self.restrictFile(path)
+        if not restricted:
             print "opening file %s" % path
             self.file_get(path)
         else:
@@ -621,19 +618,22 @@ class DropboxFUSE(LoggingMixIn):
 
         return 0
 
-    def read(self, path, size, offset, fh=None):
+    def read(self, path, size, offset, fh):
 
-        restrict = self.restrictFile(path)
-        if restrict == False:
-
-            if path not in self.files:
-                raise FuseOSError(errno.ENOENT) # no such file
-
+        restricted = self.restrictFile(path)
+        if not restricted:
             print "reading file %s" % path
+
             f = self.file_get(path)['object']
-            f.seek(offset)
-            buf = f.read(size)
-            return buf
+            if not f.closed:
+                f.seek(offset)
+                buf = f.read(size)
+                return buf
+            else:
+                print "FILE WAS CLOSED"
+                self.flush(path, None)
+                self.release(path, None)
+
         else:
             restr_path = self.get_restr_path(path)
             print "reading file %s" % restr_path
@@ -641,20 +641,16 @@ class DropboxFUSE(LoggingMixIn):
             os.lseek(fid, offset, os.SEEK_SET)
             return os.read(fid, size)
 
-    def write(self, path, buf, offset, fh=None):
+    def write(self, path, buf, offset, fh):
         
-        restrict = self.restrictFile(path)
-        if restrict == False:
-
-            if path not in self.files:
-                raise FuseOSError(errno.ENOENT) # no such file
-
+        restricted = self.restrictFile(path)
+        if not restricted:
             print "writing to file %s" % path
             fileObject = self.file_get(path) # get file object
             f = fileObject['object']
-            f.seek(offset) # set the file's current position
-            fileObject['modified'] = True # file is modified
-            f.write(buf) # write a string to the file
+            f.seek(offset)  # set the file's current position
+            fileObject['modified'] = True
+            f.write(buf)    # write to the file
             return len(buf) # return number of bytes written
         else:
             restr_path = self.get_restr_path(path)
@@ -666,12 +662,8 @@ class DropboxFUSE(LoggingMixIn):
     def truncate(self, path, length, fh=None):
         
         # shrink or extend the size of a file to the specified size
-        restrict = self.restrictFile(path)
-        if restrict == False:
-
-            if path not in self.files:
-                raise FuseOSError(errno.ENOENT) # no such file
-
+        restricted = self.restrictFile(path)
+        if not restricted:
             print "truncate: " + path
             f = self.file_get(path)['object']
             f.truncate(length)
@@ -684,10 +676,10 @@ class DropboxFUSE(LoggingMixIn):
     def create(self, path, mode):
 
         name = os.path.basename(path) # return file name
-        restrict = self.restrictFile(path)
+        restricted = self.restrictFile(path)
         # handle vim .swp and [filename]~ files
         # do not create and upload those
-        if name[0] != '.' and name != '4913' and name[-1:] != '~' and restrict == False:
+        if name[0] != '.' and name != '4913' and name[-1:] != '~' and restricted == False:
 
             print "create: " + path
             # check if the directory is in the current directory tree
@@ -703,7 +695,7 @@ class DropboxFUSE(LoggingMixIn):
 
             self.file_upload(path)
 
-        elif name[0] != '.' and restrict == True:
+        elif name[0] != '.' and restricted == True:
 
             # create dir where restricted file will be saved
             self.create_restr_dir()
@@ -717,8 +709,8 @@ class DropboxFUSE(LoggingMixIn):
 
     def release(self, path, fh):
 
-        restrict = self.restrictFile(path)
-        if restrict == False:
+        restricted = self.restrictFile(path)
+        if not restricted:
             print "release: " + path
             self.file_close(path)
         else:
@@ -731,8 +723,8 @@ class DropboxFUSE(LoggingMixIn):
     def flush(self, path, fh):
 
         # called on each close
-        restrict = self.restrictFile(path)
-        if restrict == False:
+        restricted = self.restrictFile(path)
+        if not restricted:
             print "flush: " + path
             if path in self.files:
                 if self.files[path]['modified'] == True:
@@ -746,8 +738,8 @@ class DropboxFUSE(LoggingMixIn):
     def fsync(self, path, datasync, fh=None):
         
         # flush any dirty information about the file to disk
-        restrict = self.restrictFile(path)
-        if restrict == False:
+        restricted = self.restrictFile(path)
+        if not restricted:
             print "fsync: " + path
             if path in self.files:
                 if self.files[path]['modified'] == True:
