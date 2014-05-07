@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 
-# Integration tests for dropbox_fuse.py
+# Integration tests for cloud_fuse.py
 
 from cloud_fuse import DropboxFUSE
 import os
