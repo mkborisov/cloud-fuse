@@ -51,7 +51,6 @@ class DropboxAPI():
                 return
 
             client = dropbox.client.DropboxClient(access_token)
-
             # write the access_token to file for reuse
             token_file = open(app_access_token,'w')
             token_file.write("%s" % (access_token))
@@ -157,9 +156,7 @@ class DropboxAPI():
 
 class DropboxFUSE(LoggingMixIn):
 
-    """
-    The main filesystem class. Most work will be done in here
-    """
+    # The main filesystem class. Most work will be done in here
 
     def __init__(self, mountpoint, restr_dir):
         self.dropbox_api = DropboxAPI()
@@ -471,12 +468,12 @@ class DropboxFUSE(LoggingMixIn):
     	Should remove the filesystem object at path
         It may have any type except for directory
     	"""
-
-        if path not in self.files:
-            raise FuseOSError(errno.ENOENT) # no such file
-
         restrict = self.restrictFile(path)
         if restrict == False:
+
+            if path not in self.files:
+                raise FuseOSError(errno.ENOENT) # no such file
+
             print "removing dropbox file %s" % path
             self.object_delete(path)
             try:
@@ -625,12 +622,13 @@ class DropboxFUSE(LoggingMixIn):
         return 0
 
     def read(self, path, size, offset, fh=None):
-        
-        if path not in self.files:
-            raise FuseOSError(errno.ENOENT) # no such file
 
         restrict = self.restrictFile(path)
         if restrict == False:
+
+            if path not in self.files:
+                raise FuseOSError(errno.ENOENT) # no such file
+
             print "reading file %s" % path
             f = self.file_get(path)['object']
             f.seek(offset)
@@ -644,12 +642,13 @@ class DropboxFUSE(LoggingMixIn):
             return os.read(fid, size)
 
     def write(self, path, buf, offset, fh=None):
-
-        if path not in self.files:
-            raise FuseOSError(errno.ENOENT) # no such file
-
+        
         restrict = self.restrictFile(path)
         if restrict == False:
+
+            if path not in self.files:
+                raise FuseOSError(errno.ENOENT) # no such file
+
             print "writing to file %s" % path
             fileObject = self.file_get(path) # get file object
             f = fileObject['object']
@@ -667,11 +666,12 @@ class DropboxFUSE(LoggingMixIn):
     def truncate(self, path, length, fh=None):
         
         # shrink or extend the size of a file to the specified size
-        if path not in self.files:
-            raise FuseOSError(errno.ENOENT) # no such file
-
         restrict = self.restrictFile(path)
         if restrict == False:
+
+            if path not in self.files:
+                raise FuseOSError(errno.ENOENT) # no such file
+
             print "truncate: " + path
             f = self.file_get(path)['object']
             f.truncate(length)
