@@ -1,23 +1,35 @@
 #!/usr/bin/env python
 
-import os
-import sys
-import stat
-import errno
-import pprint
-import tempfile
-import socket
-import dropbox
-from dropbox.rest import ErrorResponse
-from config import AppCredentials
-from time import time
-from threading import Lock
-from datetime import datetime
-from fuse import FUSE, FuseOSError, LoggingMixIn, fuse_get_context
+"""
+This Python script implements a file system in user space using FUSE. It's
+called CloudFUSE because the file system's primary feature is file synchronisation
+with the cloud, which enables it to represent Dropbox cloud storage as a local drive.
+"""
+
+# Try to load the required modules from Python's standard library.
+try:
+    import os
+    import sys
+    import stat
+    import argparse
+    import errno
+    import pprint
+    import tempfile
+    import socket
+    import urllib3
+    import dropbox
+    from dropbox.rest import ErrorResponse
+    from config import AppCredentials
+    from time import time
+    from datetime import datetime
+    from fuse import FUSE, FuseOSError, LoggingMixIn, fuse_get_context
+except ImportError, e:
+  msg = "Error: Failed to load one of the required modules! (%s)\n"
+  sys.stderr.write(msg % str(e))
+  sys.exit(1)
 
 class DropboxAPI():
     def __init__(self):
-        self.rwlock = Lock()
         self.client = self.dropbox_request()
         self.tree_contents = {}
         self.tree_contents_cache = {}
@@ -25,7 +37,7 @@ class DropboxAPI():
     def dropbox_request(self):
 
         app_access_token = 'dropbox_auth.conf'
-        token_file = open(app_access_token)
+        token_file = open(app_access_token, 'a+')
         token_secret = token_file.read()
         token_file.close()
 
@@ -47,9 +59,9 @@ class DropboxAPI():
             except ErrorResponse, e:
                 print "Error %s: %s" % (e.status, e.error_msg)
                 print
-                self.dropbox_request()
-                return
+                return self.dropbox_request()
 
+            print "Authorization Successful"
             client = dropbox.client.DropboxClient(access_token)
             # write the access_token to file for reuse
             token_file = open(app_access_token,'w')
@@ -62,7 +74,8 @@ class DropboxAPI():
 
         #returns the account information, such as user's display name, quota, email, etc
         acc_info = self.client.account_info()
-        pprint.PrettyPrinter(indent = 2).pprint(acc_info)
+        #pprint.PrettyPrinter(indent = 2).pprint(acc_info)
+        return acc_info
 
     def upload_f_perm(self):
 
@@ -157,13 +170,13 @@ class DropboxAPI():
 class DropboxFUSE(LoggingMixIn):
 
     # The main filesystem class. Most work will be done in here
-    def __init__(self, mountpoint, restr_dir):
+    def __init__(self, restr_dir):
         self.dropbox_api = DropboxAPI()
         self.files = {}
-        self.mountpoint = mountpoint
         self.restr_dir = restr_dir
         self.restr_files = {}
-        self.extensions = ['.ascii', '.class', '.log'] # restricted file extensions
+        # restricted/excluded file extensions
+        self.extensions = ['.ascii','.class','.log','.o','.pyc']
 
     # Helper functions
     # ================
@@ -185,24 +198,19 @@ class DropboxFUSE(LoggingMixIn):
         restr_path = os.path.join(root_dir, restr_file)
         return restr_path
 
-    """
-    def get_full_path(self, path):
-
-        root_dir = os.getcwd()
-        mnt_dir = os.path.join(root_dir, self.mountpoint)
-        path = "%s%s" % (mnt_dir[:-1], path)
-        return path
-    """
-
     def file_get(self, path, download=True): 
+
+        if path in self.files:
+            print "file_get: %s is in self.files" % path
+            try:
+                return self.files[path]
+            except:
+                print "KeyError: %s" % path
+                self.file_get(path)
 
         if path in self.restr_files:
             print "file_get: %s is in self.restr_files" % path
             return self.restr_files[path]
-
-        if path in self.files:
-            print "file_get: %s is in self.files" % path
-            return self.files[path]
         
         # tempfile stores all files in /tmp
         # generate temp file
@@ -220,7 +228,6 @@ class DropboxFUSE(LoggingMixIn):
                 print "Error %s: %s" % (e.status, e.error_msg)
                 if e.status == 404:
                     raise FuseOSError(errno.ENOENT) # no such file or dir
-
         elif download == None:
             # create or edit restricted file
             f_descr = os.open(path, os.O_RDWR|os.O_CREAT, 0664)
@@ -228,10 +235,9 @@ class DropboxFUSE(LoggingMixIn):
             # populate dict with restricted file descriptor
             self.restr_files[path] = {'file_descriptor': f_descr}                
             return self.restr_files[path]
-
         else:
-            raw = ''
             # create empty temp file
+            raw = ''
             f.write(raw)
 
         # populate dict with file object
@@ -255,22 +261,27 @@ class DropboxFUSE(LoggingMixIn):
                 self.file_upload(path)
 
             print "closing: " + path
-            self.files[path]['object'].close()
-            del self.files[path]
+            try:
+                self.files[path]['object'].close()
+                del self.files[path]
+            except:
+                print "KeyErrorOnDelete: %s" % path
+                pass
 
     def file_upload(self, path):
 
-        print 'file upload %s' % path
+        print 'uploading %s' % path
         
         if path not in self.files:
             raise FuseOSError(errno.EIO) # IO error
+
+        name = os.path.basename(path) # return file name
 
         fileObject = self.file_get(path)
         if fileObject['modified'] == False:
             return True
 
         f = fileObject['object']
-
         # go to beginning of the file
         f.seek(0)
         # get the name of temp file
@@ -278,23 +289,26 @@ class DropboxFUSE(LoggingMixIn):
         # open for writing before it gets uploaded to remote storage
         ff = open(tfName, "rw+")
 
+        response = {}
         # upload file object
         try:
             response = self.dropbox_api.client.put_file(path, ff, overwrite=True)
+        except urllib3.exceptions.MaxRetryError:
+            print "Error. Cannot connect to the Internet"
+        except urllib3.exceptions.ReadTimeoutError:
+            print "Read timed out"
         except ErrorResponse, e:
             print "Upload Error %s: %s" % (e.status, e.error_msg)
 
-        # update tree_contents
-        name = os.path.basename(path)
-        if os.path.dirname(path) in self.dropbox_api.tree_contents:
-            self.dropbox_api.tree_contents[os.path.dirname(path)][name] = \
-                {'name': name, 'type': 'file', 'size': response['bytes'], \
-                    'ctime': time(), 'mtime': time()}
+        if response != {}:
+            # update tree_contents
+            name = os.path.basename(path)
+            if os.path.dirname(path) in self.dropbox_api.tree_contents:
+                self.dropbox_api.tree_contents[os.path.dirname(path)][name] = \
+                    {'name': name, 'type': 'file', 'size': response['bytes'], \
+                        'ctime': time(), 'mtime': time()}
 
         print "FILE UPLOADED"
-        # trap any errors
-        if response['rev'] == []:
-            raise FuseOSError(errno.EIO) # IO error
 
         #ff.close() # close the file that got uploaded
         fileObject['modified'] = False
@@ -326,7 +340,6 @@ class DropboxFUSE(LoggingMixIn):
 
         # distinguish between dropbox file and local "restricted" file
         # stops a file being synchronised based on its extension
-
         fileName, fileExtension = os.path.splitext(path)
         if fileExtension not in self.extensions:
             return False
@@ -338,25 +351,28 @@ class DropboxFUSE(LoggingMixIn):
     
     def statfs(self, path):
 
-        """
-        Returns information about the mounted file system
-        512 bytes blocksize => 4 kb of data transferred per second
-        4096 total data blocks in filesystem
-        2048 of free blocks available to unprivileged user
-        """
-        return dict(f_bsize=512, f_blocks=4096, f_bavail=2048)
+        acc_info = self.dropbox_api.get_account_info()
+        total_quota = acc_info['quota_info']['quota']
+        used_quota = acc_info['quota_info']['shared'] + acc_info['quota_info']['normal']
+        available = total_quota - used_quota
+
+        statfs_data = { "f_bsize": 1,       # file system block size
+                        "f_frsize": 1,      # fragment size
+                        "f_blocks": total_quota, # size of fs in f_frsize units
+                        "f_bfree": available,    # free blocks
+                        "f_bavail": available }  # free blocks for unprivileged users
+
+        return statfs_data
 
     def getattr(self, path, fh=None):
 
         """
         Defining this method is mandatory for a working filesystem
         Returns a stat() structure
-        The files and the associated data is stored as a dictionary
+        The files and the associated data are stored as a dictionary
         """
         
-        # get fuse context
         (uid, gid, pid) = fuse_get_context()
-
         stat_result = { "st_mtime": time(), # modified time
                         "st_ctime": time(), # changed time
                         "st_atime": time(), # last access time
@@ -413,14 +429,12 @@ class DropboxFUSE(LoggingMixIn):
 
         return stat_result
 
-
     def readdir(self, path, fh=None):
         """
         Purpose: Give a listing for 'ls'
         path: String containing relative path to file
         Returns: Directory listing for 'ls' command
         """
-        #print "readdir: " + path
 
         restr_path = self.get_restr_path(path)
         restr_objects = []
@@ -585,7 +599,7 @@ class DropboxFUSE(LoggingMixIn):
     """ Unsupported operations. The system doesn't fit within this model """
         
     def chown(self, path, uid, gid):
-        # change the owner of a file or directory
+
         raise FuseOSError(errno.EPERM) # Operation not permitted
 
     def symlink(self, target, name):
@@ -649,8 +663,8 @@ class DropboxFUSE(LoggingMixIn):
             fileObject = self.file_get(path) # get file object
             f = fileObject['object']
             f.seek(offset)  # set the file's current position
-            fileObject['modified'] = True
             f.write(buf)    # write to the file
+            fileObject['modified'] = True
             return len(buf) # return number of bytes written
         else:
             restr_path = self.get_restr_path(path)
@@ -677,13 +691,19 @@ class DropboxFUSE(LoggingMixIn):
 
         name = os.path.basename(path) # return file name
         restricted = self.restrictFile(path)
-        # handle vim .swp and [filename]~ files
-        # do not create and upload those
-        if name[0] != '.' and name != '4913' and name[-1:] != '~' and restricted == False:
+
+        if restricted == False:
 
             print "create: " + path
+            # discard 'libre office' temp file creation
+            if name[:2] == '.~':
+                return 0
+            # discard 'vim' 4913 and swap files, generated when existing file gets edited
+            if name == '4913' or name[-3:] == 'swp' or name[-1:] == '~':
+                return 0
+
             # check if the directory is in the current directory tree
-            # if it is, add the new file with the proper name and path 
+            # if it is, add the new file with the proper name and path
             if os.path.dirname(path) in self.dropbox_api.tree_contents:
                 self.dropbox_api.tree_contents[os.path.dirname(path)][name] = \
                 {'name': name, 'type': 'file', 'size': 0, 'ctime': time(), 'mtime': time()}
@@ -750,16 +770,35 @@ class DropboxFUSE(LoggingMixIn):
             fid = self.file_get(restr_path, download=None)['file_descriptor']
             self.flush(restr_path, fid)
 
-def main(mountpoint, restr_dir):
+def main():
 
-    fuse = FUSE(DropboxFUSE(mountpoint, restr_dir), \
-            mountpoint, noatime=True, foreground=True)
+    parser = argparse.ArgumentParser(
+        description='Fuse filesystem for Dropbox')
+
+    parser.add_argument(
+        '-d','--debug', default=False, help="turn on fuse debug output",
+        action="store_true")
+
+    parser.add_argument(
+        '-s','--nothreads', default=False,
+        help="disallow multi-threaded operation / run on a single thread",
+        action="store_true")
+
+    parser.add_argument(
+        'mount_point', metavar='MNTDIR', help='directory to mount filesystem at')
+
+    parser.add_argument(
+        'restr_dir', metavar='RESTRDIR', help='directory to hold axcluded files')
+
+    # by default, disallow debug output and run filesystem in multi-threaded mode
+    args = parser.parse_args(sys.argv[1:])
+
+    mountpoint = args.__dict__.pop('mount_point')
+    restr_dir = args.__dict__.pop('restr_dir')
+
+    fuse_args = args.__dict__.copy()
+    fuse = FUSE(DropboxFUSE(restr_dir), \
+            mountpoint, noatime=True, foreground=True, **fuse_args)
 
 if __name__ == '__main__':
-
-    if len(sys.argv) != 3:
-        print "Wrong number of parameters."
-        print "Usage: dropbox_fuse.py <mount_point> <restr_dir>"
-        exit()
-
-    main(sys.argv[1], sys.argv[2])
+    main()

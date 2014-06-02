@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 
-# Integration tests for cloud_fuse.py
+# Integration tests for dropbox_fuse.py
 
 from cloud_fuse import DropboxFUSE
 import os
@@ -43,9 +43,9 @@ def test_readwrite():
     # equal to what was written to it
     msg = "Hello World!"
     FS.create("/TEST/testfile", os.O_CREAT)
-    FS.write("/TEST/testfile", msg, 0)
+    FS.write("/TEST/testfile", msg, 0, None)
     FS.fsync("/TEST/testfile", 0)
-    msg2 = FS.read("/TEST/testfile", len(msg), 0)
+    msg2 = FS.read("/TEST/testfile", len(msg), 0, None)
     assert msg == msg2, (msg, msg2)
     FS.unlink("/TEST/testfile")
 
@@ -56,7 +56,7 @@ def test_file_size():
     FS.create("/TEST/testf1", os.O_CREAT)
     attr = FS.getattr("/TEST/testf1")
     assert attr['st_size'] == 0, attr['st_size']
-    FS.write("/TEST/testf1", msg, 0)
+    FS.write("/TEST/testf1", msg, 0, None)
     FS.fsync("/TEST/testf1", 0)
     attr = FS.getattr("/TEST/testf1")
     assert attr['st_size'] == len(msg), (attr['st_size'], len(msg))
@@ -136,21 +136,14 @@ def test_noexists_write():
     # writing to non existent file
     msg = "Hello World!"
     with raises(FuseOSError) as excinfo:
-        FS.write("/TEST/mickey", msg, 0)
+        FS.write("/TEST/mickey", msg, 0, None)
     assert 'No such file or directory' in excinfo.value
 
 def test_noexists_read():
 
     # read non existent file
     with raises(FuseOSError) as excinfo:
-        FS.read("/TEST/mickey", 10, 0)
-    assert 'No such file or directory' in excinfo.value
-
-def test_noexists_truncate():
-
-    # truncate non existent file
-    with raises(FuseOSError) as excinfo:
-        FS.truncate("/TEST/mickey", 10)
+        FS.read("/TEST/mickey", 10, 0, None)
     assert 'No such file or directory' in excinfo.value
 
 
