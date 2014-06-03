@@ -1,5 +1,4 @@
 .\" Manpage for CloudFUSE FileSystem.
-.\" Contact mario.borisov2@mail.dcu.ie to report errors or typos.
 .TH man 8 "19 May 2014" "1.0" "CloudFUSE FileSystem man page"
 .SH NAME
 CloudFUSE \- mount dropbox storage as a local drive
@@ -20,4 +19,4 @@ fuse(8), mount(2), mount(8), fusermount(1)
 There’s an issue with Dropbox metadata API call. It always returns 0 bytes for folder size, 
 so non-empty directories currently show up to be of size 0 bytes.
 .SH AUTHOR
-Mario Borisov (mario.borisov2@mail.dcu.ie)
+Mario Borisov
