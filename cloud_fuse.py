@@ -13,7 +13,6 @@ try:
     import stat
     import argparse
     import errno
-    import pprint
     import tempfile
     import socket
     import urllib3
@@ -22,7 +21,7 @@ try:
     from config import AppCredentials
     from time import time
     from datetime import datetime
-    from fuse import FUSE, FuseOSError, LoggingMixIn, fuse_get_context
+    from fuse import FUSE, FuseOSError, LoggingMixIn, Operations, fuse_get_context
 except ImportError, e:
   msg = "Error: Failed to load one of the required modules! (%s)\n"
   sys.stderr.write(msg % str(e))
@@ -74,7 +73,6 @@ class DropboxAPI():
 
         #returns the account information, such as user's display name, quota, email, etc
         acc_info = self.client.account_info()
-        #pprint.PrettyPrinter(indent = 2).pprint(acc_info)
         return acc_info
 
     def upload_f_perm(self):
@@ -93,7 +91,7 @@ class DropboxAPI():
                 return True
         return False
 
-    def list_objects(self, path, ttl=10):
+    def list_objects(self, path, ttl=60):
 
         # for efficiency, store the last snapshot of files in memory
         # this prevents from constantly calling metadata()
@@ -106,6 +104,7 @@ class DropboxAPI():
             host = socket.getaddrinfo('api.dropbox.com', 443)
         except socket.gaierror, err:
             print "Cannot resolve hostname: ", 'api.dropbox.com', err
+            sys.exit(1)
 
         try:
             # obtain file/folder metadata from dropbox
@@ -167,7 +166,7 @@ class DropboxAPI():
         self.tree_contents_cache[path] = time() + ttl
         return self.tree_contents[path]
 
-class DropboxFUSE(LoggingMixIn):
+class DropboxFUSE(LoggingMixIn, Operations):
 
     # The main filesystem class. Most work will be done in here
     def __init__(self, restr_dir):
@@ -276,7 +275,6 @@ class DropboxFUSE(LoggingMixIn):
             raise FuseOSError(errno.EIO) # IO error
 
         name = os.path.basename(path) # return file name
-
         fileObject = self.file_get(path)
         if fileObject['modified'] == False:
             return True
@@ -309,8 +307,6 @@ class DropboxFUSE(LoggingMixIn):
                         'ctime': time(), 'mtime': time()}
 
         print "FILE UPLOADED"
-
-        #ff.close() # close the file that got uploaded
         fileObject['modified'] = False
             
     def create_directory(self, path):
