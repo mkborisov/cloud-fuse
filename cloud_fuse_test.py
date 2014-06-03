@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 
-# Integration tests for dropbox_fuse.py
+# Integration tests for cloud_fuse.py
 
 from cloud_fuse import DropboxFUSE
 import os
@@ -11,7 +11,7 @@ from fuse import FuseOSError
 
 MNT_POINT = '/home/mario/CloudFUSE/FYP/bar/'
 RESTR_DIR = '/home/mario/CloudFUSE/FYP/foo/'
-FS = DropboxFUSE(MNT_POINT, RESTR_DIR)
+FS = DropboxFUSE(RESTR_DIR)
 
 # The following tests communicate across the network and use Dropbox API
 # Purpose: Perform integration tests of the code to Dropbox API
