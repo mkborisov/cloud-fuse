@@ -1,0 +1,23 @@
+.\" Manpage for CloudFUSE FileSystem.
+.\" Contact mario.borisov2@mail.dcu.ie to report errors or typos.
+.TH man 8 "19 May 2014" "1.0" "CloudFUSE FileSystem man page"
+.SH NAME
+CloudFUSE \- mount dropbox storage as a local drive
+.SH SYNOPSIS
+cloud_fuse.py [MNTDIR, RESTRDIR]
+.SH DESCRIPTION
+CloudFUSE is a Python script that implements a file system in user space using FUSE.
+It's called CloudFUSE because the file system's primary feature is file synchronisation
+with the cloud, which enables it to mount Dropbox storage as a local drive.
+.SH OPTIONS
+CloudFUSE takes the following options
+\*n -h, --help       show this help message and exit
+\*n -d, --debug      turn on fuse debug output
+\*n -s, --nothreads  disallow multi-threaded operation / run on a single thread
+.SH SEE ALSO
+fuse(8), mount(2), mount(8), fusermount(1)
+.SH BUGS
+There’s an issue with Dropbox metadata API call. It always returns 0 bytes for folder size, 
+so non-empty directories currently show up to be of size 0 bytes.
+.SH AUTHOR
+Mario Borisov (mario.borisov2@mail.dcu.ie)
