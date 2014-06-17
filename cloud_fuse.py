@@ -784,7 +784,7 @@ def main():
         'mount_point', metavar='MNTDIR', help='directory to mount filesystem at')
 
     parser.add_argument(
-        'restr_dir', metavar='RESTRDIR', help='directory to hold axcluded files')
+        'restr_dir', metavar='RESTRDIR', help='directory to hold excluded files')
 
     # by default, disallow debug output and run filesystem in multi-threaded mode
     args = parser.parse_args(sys.argv[1:])
